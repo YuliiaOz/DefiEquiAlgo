@@ -1,13 +1,11 @@
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 
 from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import QuantileTransformer, OneHotEncoder
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
-from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.ensemble import ExtraTreesClassifier
+from sklearn.metrics import accuracy_score, f1_score
+
 
 # ============================================================
 # CONFIG
@@ -15,6 +13,9 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 
 TRAIN = "data/donnees_demandes.csv"
 TEST = "data/candidats_evaluation.csv"
+
+AWARD_RATE = 0.40
+RANDOM_STATE = 42
 
 train = pd.read_csv(TRAIN)
 test = pd.read_csv(TEST)
@@ -26,7 +27,7 @@ T = test.copy()
 
 
 # ============================================================
-# GROUPES
+# 1. GROUPES D'ÉQUITÉ
 # ============================================================
 
 REMOTE = {
@@ -35,55 +36,50 @@ REMOTE = {
     "Gaspesie-Iles-de-la-Madeleine"
 }
 
-for df in [X, T]:
+for data in [X, T]:
 
-    df["groupe"] = np.where(
-        df["region_administrative"].isin(REMOTE),
+    data["groupe"] = np.where(
+        data["region_administrative"].isin(REMOTE),
         "eloignee",
         "centre"
     )
 
 
 # ============================================================
-# 1. SCORE DE MÉRITE
+# 2. SCORE DE MÉRITE
 # ============================================================
 
 def percentile(x):
     return pd.Series(x).rank(pct=True).values
 
 
-def build_merit_score(df):
+def build_merit_score(data):
 
-    cote = percentile(df["cote_r_equivalent"])
+    cote = percentile(
+        data["cote_r_equivalent"]
+    )
 
-    # Plus bas revenu = davantage de besoin
+    # Plus faible revenu = plus grand besoin
     revenu = 1 - percentile(
-        df["revenu_familial_estime"]
+        data["revenu_familial_estime"]
     )
 
-    # Plus d'heures = contrainte plus importante
+    # Plus d'heures de travail = contrainte plus importante
     heures = percentile(
-        df["heures_travail_semaine"]
+        data["heures_travail_semaine"]
     )
 
-    # Plus loin = contrainte géographique
+    # Plus grande distance = contrainte géographique plus importante
     distance = percentile(
-        df["distance_domicile_campus_km"]
+        data["distance_domicile_campus_km"]
     )
 
     premiere_gen = (
-        df["premiere_generation_universitaire"]
+        data["premiere_generation_universitaire"]
         .astype(float)
     )
 
-    # --------------------------------------------------------
-    # SCORE PRINCIPAL
-    #
-    # Cote R = signal dominant.
-    # Les autres variables représentent surtout le besoin.
-    # --------------------------------------------------------
-
-    score = (
+    return (
         0.55 * cote
         + 0.15 * revenu
         + 0.12 * heures
@@ -91,15 +87,13 @@ def build_merit_score(df):
         + 0.08 * premiere_gen
     )
 
-    return score
-
 
 X["score_merite"] = build_merit_score(X)
 T["score_merite"] = build_merit_score(T)
 
 
 # ============================================================
-# 2. SCORE DE MÉRITE PUR
+# 3. SCORE ACADÉMIQUE
 # ============================================================
 
 X["score_academique"] = percentile(
@@ -112,25 +106,25 @@ T["score_academique"] = percentile(
 
 
 # ============================================================
-# 3. SCORE DE BESOIN
+# 4. SCORE DE BESOIN
 # ============================================================
 
-def build_need_score(df):
+def build_need_score(data):
 
     revenu = 1 - percentile(
-        df["revenu_familial_estime"]
+        data["revenu_familial_estime"]
     )
 
     heures = percentile(
-        df["heures_travail_semaine"]
+        data["heures_travail_semaine"]
     )
 
     distance = percentile(
-        df["distance_domicile_campus_km"]
+        data["distance_domicile_campus_km"]
     )
 
     premiere_gen = (
-        df["premiere_generation_universitaire"]
+        data["premiere_generation_universitaire"]
         .astype(float)
     )
 
@@ -147,10 +141,10 @@ T["score_besoin"] = build_need_score(T)
 
 
 # ============================================================
-# 4. MODÈLE HISTORIQUE SANS VARIABLES RÉGIONALES
+# 5. VARIABLES UTILISÉES PAR LE MODÈLE
 # ============================================================
 
-features_merit = [
+features = [
     "cote_r_equivalent",
     "revenu_familial_estime",
     "heures_travail_semaine",
@@ -161,12 +155,12 @@ features_merit = [
     "score_besoin"
 ]
 
-X_model = X[features_merit].copy()
-T_model = T[features_merit].copy()
+X_model = X[features].copy()
+T_model = T[features].copy()
 
 
 # ============================================================
-# 5. MODÈLE FLEXIBLE
+# 6. MODÈLE
 # ============================================================
 
 model = ExtraTreesClassifier(
@@ -177,25 +171,26 @@ model = ExtraTreesClassifier(
     max_features=0.9,
     criterion="entropy",
     class_weight="balanced",
-    random_state=42,
+    random_state=RANDOM_STATE,
     n_jobs=-1
 )
 
 
 # ============================================================
-# 6. OOF
+# 7. VALIDATION CROISÉE OOF
 # ============================================================
 
 skf = StratifiedKFold(
     n_splits=10,
     shuffle=True,
-    random_state=42
+    random_state=RANDOM_STATE
 )
 
 oof = np.zeros(len(X))
 
 for fold, (tr, va) in enumerate(
-    skf.split(X_model, y), 1
+    skf.split(X_model, y),
+    start=1
 ):
 
     print(f"Fold {fold}/10")
@@ -211,39 +206,30 @@ for fold, (tr, va) in enumerate(
 
 
 # ============================================================
-# 7. IMPORTANT :
-#    ON NE CHERCHE PAS SEULEMENT LE SEUIL 0.5
+# 8. PERFORMANCE HISTORIQUE
 # ============================================================
 
 print("\n" + "=" * 70)
-print("MODÈLE SANS RÉGION")
+print("PERFORMANCE DU MODÈLE")
 print("=" * 70)
 
-for threshold in np.arange(
-    0.30,
-    0.71,
-    0.01
-):
+oof_pred = (
+    oof >= 0.50
+).astype(int)
 
-    pred = (
-        oof >= threshold
-    ).astype(int)
+print(
+    f"Accuracy : "
+    f"{accuracy_score(y, oof_pred):.4f}"
+)
 
-    acc = accuracy_score(
-        y,
-        pred
-    )
-
-    if acc > 0.90:
-
-        print(
-            f"seuil={threshold:.2f} "
-            f"accuracy={acc:.4f}"
-        )
+print(
+    f"F1-score : "
+    f"{f1_score(y, oof_pred):.4f}"
+)
 
 
 # ============================================================
-# 8. APPRENTISSAGE FINAL
+# 9. APPRENTISSAGE FINAL
 # ============================================================
 
 model.fit(
@@ -257,47 +243,32 @@ test_probability = model.predict_proba(
 
 
 # ============================================================
-# 9. COMBINAISON MODÈLE + SCORE LATENT
+# 10. SCORES LATENTS
 # ============================================================
 
-merit = T["score_merite"].values
-academic = T["score_academique"].values
-need = T["score_besoin"].values
-
-
-# Plusieurs conceptions possibles
-scores = {
-
-    "modele_pur":
-        test_probability,
-
-    "merite_60":
-        0.60 * test_probability
-        + 0.40 * merit,
-
-    "merite_70":
-        0.70 * test_probability
-        + 0.30 * merit,
-
-    "academique_50":
-        0.50 * test_probability
-        + 0.30 * academic
-        + 0.20 * need,
-
-    "merite_besoin":
-        0.50 * test_probability
-        + 0.30 * merit
-        + 0.20 * need,
-
-    "equilibre":
-        0.40 * test_probability
-        + 0.35 * academic
-        + 0.25 * need
-}
+merit = T["score_merite"].to_numpy()
+academic = T["score_academique"].to_numpy()
+need = T["score_besoin"].to_numpy()
 
 
 # ============================================================
-# 10. CORRECTION RÉGIONALE PAR RANG
+# 11. SCORE FINAL DE BASE
+# ============================================================
+
+# Le modèle reste le signal principal.
+# Les scores explicites ajoutent une dimension
+# de mérite et de besoin socio-économique.
+
+score_base = (
+    0.50 * test_probability
+    + 0.30 * merit
+    + 0.10 * academic
+    + 0.10 * need
+)
+
+
+# ============================================================
+# 12. CORRECTION PAR RANG INTRA-GROUPE
 # ============================================================
 
 def group_rank_adjustment(
@@ -308,26 +279,33 @@ def group_rank_adjustment(
 
     score = np.asarray(score)
 
+    # Classement global
     global_rank = (
         pd.Series(score)
         .rank(pct=True)
-        .values
+        .to_numpy()
     )
 
+    # Classement à l'intérieur de chaque groupe
     group_rank = np.zeros(len(score))
 
-    for g in np.unique(groups):
+    for group in np.unique(groups):
 
-        idx = np.where(groups == g)[0]
+        idx = np.where(
+            groups == group
+        )[0]
 
         group_rank[idx] = (
             pd.Series(score[idx])
             .rank(pct=True)
-            .values
+            .to_numpy()
         )
 
-    # alpha = 0 → classement global
-    # alpha = 1 → classement entièrement intra-groupe
+    # alpha = 0 :
+    # classement totalement global
+    #
+    # alpha = 1 :
+    # classement totalement intra-groupe
 
     return (
         (1 - alpha) * global_rank
@@ -335,148 +313,269 @@ def group_rank_adjustment(
     )
 
 
-# ============================================================
-# 11. GÉNÉRATION DE PLUSIEURS CANDIDATS
-# ============================================================
-
-groups = T["groupe"].values
-
-candidates = []
-
-
-for score_name, base_score in scores.items():
-
-    for alpha in np.arange(
-        0.00,
-        1.01,
-        0.05
-    ):
-
-        adjusted = group_rank_adjustment(
-            base_score,
-            groups,
-            alpha
-        )
-
-        for rate in [
-            0.36,
-            0.37,
-            0.38,
-            0.39,
-            0.40,
-            0.41,
-            0.42,
-            0.43,
-            0.44
-        ]:
-
-            n = round(
-                len(T) * rate
-            )
-
-            order = np.argsort(
-                -adjusted
-            )
-
-            pred = np.zeros(
-                len(T),
-                dtype=int
-            )
-
-            pred[
-                order[:n]
-            ] = 1
-
-            candidates.append({
-                "strategy": score_name,
-                "alpha": alpha,
-                "rate": rate,
-                "score": adjusted,
-                "prediction": pred
-            })
+groups = T["groupe"].to_numpy()
 
 
 # ============================================================
-# 12. SAUVEGARDER TOUS LES CANDIDATS
+# 13. FRONT DE PARETO SUR LES DONNÉES HISTORIQUES
+# ============================================================
+#
+# IMPORTANT :
+# L'accuracy doit être calculée sur les données historiques,
+# car ce sont les seules données pour lesquelles nous avons
+# une décision historique y.
+#
+# Le jeu TEST (4 000 candidats) sert uniquement à produire
+# la soumission finale.
 # ============================================================
 
-import os
+pareto_results = []
 
-os.makedirs(
-    "candidates",
-    exist_ok=True
+alphas = np.arange(
+    0.00,
+    1.01,
+    0.05
 )
 
-summary = []
+# ------------------------------------------------------------
+# Score historique de base
+# ------------------------------------------------------------
 
-for i, candidate in enumerate(candidates):
+score_historique = (
+    0.50 * oof
+    + 0.30 * X["score_merite"].to_numpy()
+    + 0.10 * X["score_academique"].to_numpy()
+    + 0.10 * X["score_besoin"].to_numpy()
+)
 
-    filename = (
-        f"candidates/"
-        f"{i:04d}_"
-        f"{candidate['strategy']}_"
-        f"a{candidate['alpha']:.2f}_"
-        f"r{candidate['rate']:.2f}.csv"
+groups_historique = X["groupe"].to_numpy()
+
+# Budget historique : 40 %
+n_awards_historique = round(
+    len(X) * AWARD_RATE
+)
+
+for alpha in alphas:
+
+    adjusted_score = group_rank_adjustment(
+        score_historique,
+        groups_historique,
+        alpha
     )
 
-    submission = pd.DataFrame({
-        "id_candidat":
-            test["id_candidat"],
-        "decision_octroi":
-            candidate["prediction"]
-    })
+    # --------------------------------------------------------
+    # Sélection des 40 % meilleurs
+    # --------------------------------------------------------
 
-    submission.to_csv(
-        filename,
-        index=False
+    order = np.argsort(
+        -adjusted_score
     )
 
-    summary.append({
-        "id": i,
-        "strategy": candidate["strategy"],
-        "alpha": candidate["alpha"],
-        "rate": candidate["rate"],
-        "n_awards":
-            candidate["prediction"].sum()
+    prediction = np.zeros(
+        len(X),
+        dtype=int
+    )
+
+    prediction[
+        order[:n_awards_historique]
+    ] = 1
+
+    # --------------------------------------------------------
+    # Performance historique
+    # --------------------------------------------------------
+
+    accuracy = accuracy_score(
+        y,
+        prediction
+    )
+
+    f1 = f1_score(
+        y,
+        prediction
+    )
+
+    # --------------------------------------------------------
+    # Parité démographique
+    # --------------------------------------------------------
+
+    centre_rate = prediction[
+        groups_historique == "centre"
+    ].mean()
+
+    remote_rate = prediction[
+        groups_historique == "eloignee"
+    ].mean()
+
+    parity_gap = abs(
+        centre_rate - remote_rate
+    )
+
+    pareto_results.append({
+
+        "alpha": alpha,
+
+        "taux_octroi":
+            prediction.mean(),
+
+        "accuracy":
+            accuracy,
+
+        "f1":
+            f1,
+
+        "taux_centre":
+            centre_rate,
+
+        "taux_eloignee":
+            remote_rate,
+
+        "parity_gap":
+            parity_gap
     })
 
 
-summary = pd.DataFrame(summary)
-
-summary.to_csv(
-    "candidates/INDEX.csv",
-    index=False
+pareto = pd.DataFrame(
+    pareto_results
 )
 
 
 # ============================================================
-# 13. SOUMISSION PAR DÉFAUT
+# 14. AFFICHAGE DU FRONT DE PARETO
 # ============================================================
 
-# On commence avec :
-# - score mérite_besoin
-# - correction régionale modérée
-# - 40 %
+print("\n" + "=" * 70)
+print("FRONT DE PARETO")
+print("=" * 70)
 
-selected = None
+print(
+    pareto[
+        [
+            "alpha",
+            "taux_octroi",
+            "accuracy",
+            "f1",
+            "taux_centre",
+            "taux_eloignee",
+            "parity_gap"
+        ]
+    ].round(4).to_string(index=False)
+)
 
-for candidate in candidates:
 
-    if (
-        candidate["strategy"] == "merite_besoin"
-        and abs(candidate["alpha"] - 0.25) < 1e-9
-        and abs(candidate["rate"] - 0.40) < 1e-9
-    ):
+# ============================================================
+# 15. GRAPHIQUE DU FRONT DE PARETO
+# ============================================================
 
-        selected = candidate
-        break
+plt.figure(figsize=(9, 6))
 
+plt.plot(
+    pareto["parity_gap"],
+    pareto["accuracy"],
+    marker="o"
+)
+
+plt.xlabel(
+    "Écart de parité démographique"
+)
+
+plt.ylabel(
+    "Accuracy historique"
+)
+
+plt.title(
+    "Front de Pareto — Équité vs utilité"
+)
+
+plt.grid(
+    alpha=0.3
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    "pareto_front.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+
+# ============================================================
+# 16. CHOIX DU MODÈLE FINAL
+# ============================================================
+
+# Accuracy avec alpha = 0
+accuracy_reference = pareto.loc[
+    pareto["alpha"] == 0,
+    "accuracy"
+].iloc[0]
+
+# On accepte une perte maximale de 3 points
+max_accuracy_loss = 0.03
+
+acceptable = pareto[
+    pareto["accuracy"]
+    >=
+    accuracy_reference - max_accuracy_loss
+].copy()
+
+# Parmi les solutions acceptables,
+# on choisit celle avec le plus petit écart de parité.
+
+selected_row = acceptable.loc[
+    acceptable["parity_gap"].idxmin()
+]
+
+selected_alpha = float(
+    selected_row["alpha"]
+)
+
+print(
+    f"\nAlpha sélectionné : "
+    f"{selected_alpha:.2f}"
+)
+
+
+# ============================================================
+# 17. APPLICATION AU JEU D'ÉVALUATION
+# ============================================================
+
+# ------------------------------------------------------------
+# Maintenant seulement, on applique la stratégie choisie
+# aux 4 000 candidats du jeu TEST.
+# ------------------------------------------------------------
+
+final_score = group_rank_adjustment(
+    score_base,
+    groups,
+    selected_alpha
+)
+
+order = np.argsort(
+    -final_score
+)
+
+final_prediction = np.zeros(
+    len(T),
+    dtype=int
+)
+
+n_awards = round(
+    len(T) * AWARD_RATE
+)
+
+final_prediction[
+    order[:n_awards]
+] = 1
+
+# ============================================================
+# 18. CRÉATION DE predictions.csv
+# ============================================================
 
 final_submission = pd.DataFrame({
-    "id_candidat":
-        test["id_candidat"],
-    "decision_octroi":
-        selected["prediction"]
+    "id_candidat": test["id_candidat"],
+    "decision_octroi": final_prediction
 })
 
 final_submission.to_csv(
@@ -486,35 +585,84 @@ final_submission.to_csv(
 
 
 # ============================================================
-# 14. RAPPORT
+# 19. VALIDATION DE LA SOUMISSION
 # ============================================================
 
+assert len(final_submission) == 4000
+
+assert list(final_submission.columns) == [
+    "id_candidat",
+    "decision_octroi"
+]
+
+assert set(
+    final_submission["decision_octroi"].unique()
+).issubset({0, 1})
+
+award_rate = (
+    final_submission["decision_octroi"].mean()
+)
+
+assert 0.36 <= award_rate <= 0.44
+
+
+# ============================================================
+# 20. RAPPORT FINAL
+# ============================================================
+
+centre_final = final_prediction[
+    groups == "centre"
+].mean()
+
+remote_final = final_prediction[
+    groups == "eloignee"
+].mean()
+
+final_gap = abs(
+    centre_final - remote_final
+)
+
+
 print("\n" + "=" * 70)
-print("TERMINÉ")
+print("SOUMISSION FINALE")
 print("=" * 70)
+
+print(
+    f"Alpha sélectionné : {selected_alpha:.2f}"
+)
 
 print(
     f"Nombre de candidats : {len(test)}"
 )
 
 print(
-    f"Nombre d'octrois : "
-    f"{selected['prediction'].sum()}"
+    f"Nombre d'octrois : {final_prediction.sum()}"
 )
 
 print(
-    f"Taux d'octroi : "
-    f"{selected['prediction'].mean() * 100:.2f}%"
+    f"Taux d'octroi : {award_rate * 100:.2f}%"
 )
 
 print(
-    "\nFichier principal : predictions.csv"
+    f"Taux Centre : {centre_final * 100:.2f}%"
 )
 
 print(
-    "Candidats supplémentaires : candidates/"
+    f"Taux Éloignée : {remote_final * 100:.2f}%"
 )
 
 print(
-    "Index des candidats : candidates/INDEX.csv"
+    f"Écart de parité : {final_gap:.4f}"
+)
+
+print(
+    "\nFichiers générés :"
+)
+
+print(
+    "  ✓ predictions.csv"
+)
+
+print(
+    "  ✓ pareto_front.png"
 )
